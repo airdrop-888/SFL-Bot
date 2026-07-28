@@ -88,10 +88,11 @@
     AUTO_BUY_SEEDS:true, AUTO_SELL:true, AUTO_FRUIT:true, AUTO_COMPOSTER:true,
     SELL_KEEP:50, LOG_LEVEL:'info',
     // v6.2 additions
-    DELIVERY_SKIP_THRESHOLD: 3,   // skip orders needing >3 different item types
-    DELIVERY_MAX_MISSING: 0.7,    // skip if we have less than 30% of needed items
+    DELIVERY_SKIP_THRESHOLD: 5,   // skip orders needing >5 different item types
+    DELIVERY_MAX_MISSING: 0.5,    // skip if we have less than 50% of needed items
     DELIVERY_AUTO_SKIP: true,     // auto-skip impossible deliveries
-    DELIVERY_RETRY_COOLDOWN: 120000, // don't retry failed delivery for 2 min
+    DELIVERY_RETRY_COOLDOWN: 10000, // retry delivery every 10s
+    DELIVERY_PRIORITY_BOOST: true,  // boost delivery when ready orders exist
   };
 
   // ======================== STATE ========================
@@ -163,7 +164,7 @@
   function send(type, payload = {}) {
     if (!S.svc) return false;
     try { S.svc.send(type, payload); return true; }
-    catch(e) { S.stats.errors++; L.d(`Error: ${type} - ${e.message}`); return false; }
+    catch(e) { S.stats.errors++; L.w(`⚠️ Send error [${type}]: ${e.message}`); return false; }
   }
 
   // ======================== AUTO-RECONNECT ========================
@@ -354,15 +355,25 @@
         itemCount: itemNames.length,
       };
 
-      // Classification logic
-      if (missingTypes === 0) {
+      // Only skip if truly impossible: rare items we can't grow with very low fulfillment
+      const isRareBlocked = itemNames.some(name => {
+        if (!RARE_ITEMS.includes(name)) return false;
+        const have = Number(inv[name] || 0);
+        const need = Number(items[name] || 0);
+        return need > 0 && have < need * 0.3; // Less than 30% of rare item
+      });
+
+      // Skip logic: only truly impossible orders
+      if (isRareBlocked && fulfillmentRatio < 0.3) {
+        result.impossible.push(orderInfo);  // Truly impossible - rare items with low fulfillment
+      } else if (missingTypes === 0) {
         result.ready.push(orderInfo);  // Everything ready, deliver now!
-      } else if (!canFulfill || missingTypes > CFG.DELIVERY_SKIP_THRESHOLD || fulfillmentRatio < CFG.DELIVERY_MAX_MISSING) {
-        result.impossible.push(orderInfo);  // Skip this, too hard
-      } else if (missingTypes <= 2 && fulfillmentRatio >= 0.5) {
+      } else if (missingTypes <= CFG.DELIVERY_SKIP_THRESHOLD && fulfillmentRatio >= CFG.DELIVERY_MAX_MISSING) {
         result.feasible.push(orderInfo);  // Worth pursuing
+      } else if (missingTypes <= 2 || fulfillmentRatio >= 0.3) {
+        result.hard.push(orderInfo);  // Challenging but possible
       } else {
-        result.hard.push(orderInfo);  // Possible but not ideal
+        result.impossible.push(orderInfo);  // Too many missing
       }
     }
 
@@ -857,16 +868,30 @@
 
       if (hasAll) {
         L.i(`📦 Delivering to ${order.from || 'NPC'}: ${itemNames.filter(n=>n!=='coins').join(', ')} → +${reward} coins`);
-        if (send('order.delivered', { id: order.id, friendship: true })) {
+        const result = send('order.delivered', { id: order.id, friendship: true });
+        if (result) {
           S.stats.delivered = (S.stats.delivered || 0) + 1;
           markTaskSuccess('deliver');
           delete S.deliveryCache.feasible[order.id];
           await sleep(2000);
           updateState();
-          L.i(`📦 Delivery complete! Coins: ${fmt(coins())}`);
+          L.i(`📦 ✅ Delivery complete! Coins: ${fmt(coins())}`);
           return true;
+        } else {
+          L.w(`📦 ❌ Delivery send failed for order #${order.id} — trying alternate payload...`);
+          // Try with just the id (some game versions need different payload)
+          const alt = send('order.delivered', { id: order.id });
+          if (alt) {
+            S.stats.delivered = (S.stats.delivered || 0) + 1;
+            markTaskSuccess('deliver');
+            delete S.deliveryCache.feasible[order.id];
+            await sleep(2000);
+            updateState();
+            L.i(`📦 ✅ Delivery complete (alt)! Coins: ${fmt(coins())}`);
+            return true;
+          }
+          L.e(`📦 ❌ Delivery FAILED for order #${order.id} — both payloads failed`);
         }
-        L.w(`Delivery failed for order #${order.id}`);
       }
     }
 
@@ -878,8 +903,8 @@
       L.d(`📦 Working on: ${summary}`);
     }
 
-    // Don't spam-check deliveries
-    S.tasks.deliver.nextRun = now + CFG.DELIVERY_RETRY_COOLDOWN;
+    // Check again soon — ready orders need immediate attention
+    S.tasks.deliver.nextRun = now + (analysis.ready?.length ? 2000 : CFG.DELIVERY_RETRY_COOLDOWN);
     return false;
   }
 
@@ -1010,18 +1035,18 @@
     S.tasks = {
       harvest:   { name:'Harvest',   priority:1,  nextRun:now, cooldown:5000,  action:doHarvest },
       plant:     { name:'Plant',     priority:2,  nextRun:now, cooldown:5000,  action:doPlant },
-      eat:       { name:'Eat',       priority:3,  nextRun:now, cooldown:5000,  action:doEat },
-      buy:       { name:'Buy',       priority:4,  nextRun:now, cooldown:30000, action:doBuySeeds },
-      cook:      { name:'Cook',      priority:5,  nextRun:now, cooldown:5000,  action:doCook },
-      deliver:   { name:'Deliver',   priority:12, nextRun:now, cooldown:120000, action:doDeliver },
-      sell:      { name:'Sell',      priority:7,  nextRun:now, cooldown:30000, action:doSell },
-      fruit:     { name:'Fruit',     priority:8,  nextRun:now, cooldown:30000, action:doHarvestFruit },
-      composter: { name:'Compost',   priority:9,  nextRun:now, cooldown:60000, action:doComposter },
-      chop:      { name:'Chop',      priority:6,  nextRun:now, cooldown:60000, action:doChop },
-      mine:      { name:'Mine',      priority:10, nextRun:now, cooldown:60000, action:doMine },
-      skip:      { name:'Skip',      priority:11, nextRun:now, cooldown:120000, action:doSkipOrders },
-      animals:   { name:'Animals',   priority:13, nextRun:now, cooldown:14400000, action:doAnimals },
-      pets:      { name:'Pets',      priority:14, nextRun:now, cooldown:43200000, action:doPets },
+      deliver:   { name:'Deliver',   priority:3,  nextRun:now, cooldown:CFG.DELIVERY_RETRY_COOLDOWN, action:doDeliver },
+      eat:       { name:'Eat',       priority:4,  nextRun:now, cooldown:5000,  action:doEat },
+      buy:       { name:'Buy',       priority:5,  nextRun:now, cooldown:30000, action:doBuySeeds },
+      cook:      { name:'Cook',      priority:6,  nextRun:now, cooldown:5000,  action:doCook },
+      chop:      { name:'Chop',      priority:7,  nextRun:now, cooldown:60000, action:doChop },
+      sell:      { name:'Sell',      priority:8,  nextRun:now, cooldown:30000, action:doSell },
+      fruit:     { name:'Fruit',     priority:9,  nextRun:now, cooldown:30000, action:doHarvestFruit },
+      composter: { name:'Compost',   priority:10, nextRun:now, cooldown:60000, action:doComposter },
+      mine:      { name:'Mine',      priority:11, nextRun:now, cooldown:60000, action:doMine },
+      skip:      { name:'Skip',      priority:13, nextRun:now, cooldown:120000, action:doSkipOrders },
+      animals:   { name:'Animals',   priority:14, nextRun:now, cooldown:14400000, action:doAnimals },
+      pets:      { name:'Pets',      priority:15, nextRun:now, cooldown:43200000, action:doPets },
     };
   }
 
@@ -1035,6 +1060,32 @@
 
     // Track XP every tick
     trackXP();
+
+    // *** PRIORITY BOOST: If delivery has ready orders, deliver IMMEDIATELY ***
+    if (CFG.DELIVERY_PRIORITY_BOOST && S.tasks.deliver.nextRun <= now) {
+      try {
+        const g = gs();
+        if (g?.delivery?.orders) {
+          const inv = g.inventory || {};
+          const readyOrder = g.delivery.orders.find(order => {
+            if (order.completedAt || now < order.readyAt) return false;
+            const items = order.items || {};
+            return Object.keys(items).every(name => {
+              const need = Number(items[name] || 0);
+              if (name === 'coins') return Number(g.coins || 0) >= need;
+              return Number(inv[name] || 0) >= need;
+            });
+          });
+          if (readyOrder) {
+            L.i('📦⚡ Priority deliver check...');
+            const result = await doDeliver();
+            lastEventTime = Date.now();
+            isRunning = false;
+            return; // Skip rest of scheduler this tick
+          }
+        }
+      } catch(e) { L.e('Delivery priority error:', e); }
+    }
 
     const due = Object.entries(S.tasks)
       .filter(([, t]) => t.nextRun <= now)
