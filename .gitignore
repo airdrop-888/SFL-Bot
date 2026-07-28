@@ -1,0 +1,7 @@
+# Game bundles (large files, not part of the bot script)
+assets/
+index-CuaVg5Q9.js
+
+# OS
+.DS_Store
+Thumbs.db
